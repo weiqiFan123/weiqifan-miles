@@ -31,6 +31,7 @@ from ..training_utils.log_utils import aggregate_forward_results, aggregate_trai
 from ..training_utils.loss import loss_function
 from ..training_utils.parallel import get_parallel_state
 from .checkpoint import load_checkpoint, save_checkpoint, save_checkpoint_with_lora
+from .chunked_lm_head import chunked_head_kwargs
 from .ci_utils import (
     check_model_hashes,
     check_peak_gpu_memory_after_load,
@@ -270,6 +271,7 @@ def forward_only(
             labels=None,
             packed_seq_params=packed_seq_params,
             loss_mask=batch["full_loss_masks"],
+            **chunked_head_kwargs(args),
             **(batch["multimodal_train_inputs"] if batch["multimodal_train_inputs"] is not None else {}),
         )
 
@@ -418,6 +420,8 @@ def train_one_step(
             m.stage = "replay_forward"
 
         if return_schedule_plan:
+            if getattr(args, "chunked_lm_head_size", 0):
+                raise ValueError("Chunked LM head does not support combined pipeline schedules")
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
             output_tensor = model.build_schedule_plan(
                 input_ids=batch["tokens"],
@@ -443,6 +447,7 @@ def train_one_step(
             if (x := batch["multimodal_train_inputs"]) is not None:
                 forward_kwargs.update(x)
 
+            forward_kwargs.update(chunked_head_kwargs(args))
             output_tensor = model(**forward_kwargs)
 
         for m, old_stage in zip(all_replay_managers, old_stages, strict=True):
