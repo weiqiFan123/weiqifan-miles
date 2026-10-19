@@ -77,6 +77,10 @@ def _project(
         raise ValueError("Chunked LM head requires BF16 or FP32 hidden states")
     if weight.dtype != torch.float32:
         raise ValueError("Chunked LM head requires FP32 output weights")
+    # Match the FP32 head's input cast BEFORE TP/SP communication. Backward
+    # must sum FP32 shard contributions before casting back to the backbone
+    # dtype; reducing already-rounded BF16 contributions changes its gradient.
+    hidden = hidden.to(weight.dtype)
     group = output_layer.tp_group
     if output_layer.sequence_parallel:
         # Gather H, not logits; backward reduce-scatters the TP contributions.

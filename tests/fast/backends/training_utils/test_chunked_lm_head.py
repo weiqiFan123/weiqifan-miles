@@ -278,51 +278,52 @@ def _tp_worker(rank, rendezvous):
         # hard-coded to CUDA: redirect ONLY that allocation selector to CPU.
         # This is not an NCCL/GPU integration test.
         sys.path[:0] = [str(ROOT), str(MEGATRON_ROOT)]
-        for sequence_parallel in (False, True):
-            torch.manual_seed(13)
-            hidden_full = torch.randn(10, 1, 4, requires_grad=True)
-            weight_full = torch.randn(14, 4, requires_grad=True)
-            ids = torch.arange(10).reshape(1, 10)
-            hidden = (
-                (
-                    hidden_full.detach().chunk(2)[rank]
+        for hidden_dtype in (torch.float32, torch.bfloat16):
+            for sequence_parallel in (False, True):
+                torch.manual_seed(13)
+                hidden_full = torch.randn(10, 1, 4, dtype=hidden_dtype, requires_grad=True)
+                weight_full = torch.randn(14, 4, requires_grad=True)
+                ids = torch.arange(10).reshape(1, 10)
+                hidden = (
+                    (
+                        hidden_full.detach().chunk(2)[rank]
+                        if sequence_parallel
+                        else hidden_full.detach()
+                    )
+                    .clone()
+                    .requires_grad_()
+                )
+                weight = weight_full.detach().chunk(2)[rank].clone().requires_grad_()
+                layer = SimpleNamespace(
+                    bias=None,
+                    weight=weight,
+                    tp_group=dist.group.WORLD,
+                    sequence_parallel=sequence_parallel,
+                )
+                with patch("torch.cuda.current_device", return_value=torch.device("cpu")):
+                    actual = adapter._project(
+                        hidden, layer, None, ids, chunk_size=4, temperature=1.0
+                    )
+                    dense = hidden_full[:, 0].float() @ weight_full.t()
+                    # Existing fused CE rounds the logit gradient through BF16.
+                    dense.register_hook(lambda g: g.to(torch.bfloat16).float())
+                    ref = (
+                        dense.log_softmax(-1)
+                        .gather(1, ids.reshape(-1).roll(-1)[:, None])
+                        .reshape(1, -1, 1)
+                    )
+                    torch.testing.assert_close(actual, ref, atol=2e-6, rtol=2e-6)
+                    actual.sum().backward()
+                    ref.sum().backward()
+                expected = (
+                    hidden_full.grad.chunk(2)[rank]
                     if sequence_parallel
-                    else hidden_full.detach()
+                    else hidden_full.grad
                 )
-                .clone()
-                .requires_grad_()
-            )
-            weight = weight_full.detach().chunk(2)[rank].clone().requires_grad_()
-            layer = SimpleNamespace(
-                bias=None,
-                weight=weight,
-                tp_group=dist.group.WORLD,
-                sequence_parallel=sequence_parallel,
-            )
-            with patch("torch.cuda.current_device", return_value=torch.device("cpu")):
-                actual = adapter._project(
-                    hidden, layer, None, ids, chunk_size=4, temperature=1.0
+                torch.testing.assert_close(hidden.grad, expected, atol=2e-5, rtol=2e-5)
+                torch.testing.assert_close(
+                    weight.grad, weight_full.grad.chunk(2)[rank], atol=2e-5, rtol=2e-5
                 )
-                dense = hidden_full[:, 0] @ weight_full.t()
-                # Existing fused CE rounds the logit gradient through BF16.
-                dense.register_hook(lambda g: g.to(torch.bfloat16).float())
-                ref = (
-                    dense.log_softmax(-1)
-                    .gather(1, ids.reshape(-1).roll(-1)[:, None])
-                    .reshape(1, -1, 1)
-                )
-                torch.testing.assert_close(actual, ref, atol=2e-6, rtol=2e-6)
-                actual.sum().backward()
-                ref.sum().backward()
-            expected = (
-                hidden_full.grad.chunk(2)[rank]
-                if sequence_parallel
-                else hidden_full.grad
-            )
-            torch.testing.assert_close(hidden.grad, expected, atol=2e-5, rtol=2e-5)
-            torch.testing.assert_close(
-                weight.grad, weight_full.grad.chunk(2)[rank], atol=2e-5, rtol=2e-5
-            )
     finally:
         dist.destroy_process_group()
 
